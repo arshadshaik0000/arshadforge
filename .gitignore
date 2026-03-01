@@ -21,7 +21,6 @@ correct/
 recreate/
 with/
 \#/
-*.pdf
 data/reports.db-shm
 data/reports.db-wal
 .gemini/
