@@ -11,36 +11,36 @@
 
 ```
                               ┌──────────────────────────────────────────────┐
-                              │              QUERY PIPELINE                 │
-                              │                                             │
-User Query ──► FastAPI ──────►│  ┌─────────┐     ┌────────────────────┐     │
+                              │              QUERY PIPELINE                  │
+                              │                                              │
+User Query ──► FastAPI ──────►│  ┌──────────┐     ┌────────────────────┐     │
               /query          │  │ PLANNER  │────►│ TOOL EXECUTION     │     │
                               │  │ (intent  │     │                    │     │
                               │  │ classify)│     │ ┌─ vector_retrieval│     │
-                              │  └─────────┘     │ ├─ sql_query       │     │
-                              │                  │ ├─ python_calculator│    │
-                              │                  │ └─ citation_valid. │     │
-                              │                  └────────┬───────────┘     │
-                              │                           │                 │
-                              │                  ┌────────▼───────────┐     │
-                              │                  │ LLM COMPOSER       │     │
-                              │                  │ (formatting only)  │     │
-                              │                  └────────┬───────────┘     │
-                              │                           │                 │
-                              │                  ┌────────▼───────────┐     │
-                              │                  │ TRACE LOGGER       │     │──► JSON Trace
-                              │                  └────────────────────┘     │
+                              │  └──────────┘     │ ├─ sql_query       │     │
+                              │                   │ ├─ python_calculator│    │
+                              │                   │ └─ citation_valid. │     │
+                              │                   └────────┬───────────┘     │
+                              │                            │                 │
+                              │                   ┌────────▼───────────┐     │
+                              │                   │ LLM COMPOSER       │     │
+                              │                   │ (formatting only)  │     │
+                              │                   └────────┬───────────┘     │
+                              │                            │                 │
+                              │                   ┌────────▼───────────┐     │
+                              │                   │ TRACE LOGGER       │     │──► JSON Trace
+                              │                   └────────────────────┘     │
                               └──────────────────────────────────────────────┘
 
-                              ┌─────────────────┐     ┌─────────────────┐
+                              ┌──────────────────┐      ┌──────────────────┐
                               │   ChromaDB       │     │    SQLite        │
                               │   (vectors)      │     │   (structured)   │
                               │   - text chunks  │     │   - growth_proj  │
                               │   - table chunks │     │   - regional_off │
                               │   - MiniLM-L6-v2 │     │   - firm_sizes   │
-                              └─────────────────┘     │   - sector_summ  │
-                                                      │   - gva_estimates │
-                                                      └─────────────────┘
+                              └──────────────────┘     │   - sector_summ  │
+                                                       │   - gva_estimates│
+                                                       └──────────────────┘
 ```
 
 ### Why NOT Naive RAG
