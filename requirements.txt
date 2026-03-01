@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+pydantic
+python-multipart
+pdfplumber
+tiktoken
+chromadb
+sentence-transformers
+httpx
+numpy
+python-dotenv

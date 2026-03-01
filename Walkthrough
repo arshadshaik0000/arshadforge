@@ -1,0 +1,550 @@
+# ArshadForge — Comprehensive Project Analysis
+
+> Full in-depth code review of every module, function, and design decision.
+
+---
+
+## 1. Project Overview
+
+**ArshadForge** is a **production-grade, agentic intelligence backend** designed to analyze a single PDF document — the *"State of the Cyber Security Sector in Ireland 2022 Report"*. It converts this report into a **queryable, auditable intelligence platform** using a deterministic, tool-augmented pipeline rather than a naive RAG (Retrieval-Augmented Generation) system.
+
+### Core Philosophy (3 Principles)
+
+| Principle | Meaning |
+|---|---|
+| **Determinism** | No LLM reasoning for data retrieval, math, or planning. All numeric answers come from SQL or Python `eval()`. |
+| **Auditability** | Every query produces a full JSON trace with tool inputs, outputs, timing, and success/failure status. |
+| **Minimal LLM Dependence** | The LLM (`llama3:8b` via Ollama) is used **only** for composing final natural language answers from pre-computed data, and even then only for the "general" intent. |
+
+### Technology Stack
+
+| Component | Technology |
+|---|---|
+| Web Framework | FastAPI + Uvicorn |
+| Vector Database | ChromaDB (persistent, local) |
+| Relational Database | SQLite (WAL mode, row_factory) |
+| Embedding Model | `sentence-transformers/all-MiniLM-L6-v2` (384-dim) |
+| LLM | Ollama with `llama3:8b` (local) |
+| PDF Parser | `pdfplumber` |
+| Tokenizer | `tiktoken` (cl100k_base encoding) |
+| HTTP Client | `httpx` |
+| Config | `python-dotenv` (.env file) |
+
+---
+
+## 2. Repository Structure
+
+```
+ArshadForge/
+├── .env / .env.example          # Environment config (Ollama URL, model, paths)
+├── requirements.txt             # 11 Python dependencies (no LangChain!)
+├── README.md                    # 320-line comprehensive documentation
+├── run_tests.py                 # 5-test evaluation harness
+│
+├── etl/                         # ETL Pipeline (Extract → Transform → Load)
+│   ├── extract.py               # PDF → text blocks + tables
+│   ├── transform.py             # Chunking + table classification
+│   └── load.py                  # ChromaDB + SQLite loading
+│
+├── storage/                     # Data Layer
+│   ├── schema.sql               # 6 SQLite table definitions + indexes
+│   ├── db.py                    # Connection manager + data seeding
+│   └── embeddings.py            # Singleton embedding function
+│
+├── agents/                      # Agent Layer
+│   ├── planner.py               # Rule-based intent classifier
+│   ├── tools.py                 # 4 deterministic tools
+│   ├── graph.py                 # Pipeline controller (988 lines, largest file)
+│   └── citation_pruner.py       # Deterministic citation scoring
+│
+├── backend/                     # API Layer
+│   └── main.py                  # FastAPI server (3 endpoints)
+│
+├── data/                        # Storage (auto-generated)
+│   └── reports.db               # SQLite database
+│
+└── logs/                        # Execution traces (auto-generated)
+```
+
+---
+
+## 3. ETL Pipeline — In Depth
+
+### 3.1 [extract.py](file:///Users/arshadshaik/Desktop/ArshadForge/etl/extract.py) (169 lines)
+
+**Purpose**: Reads the PDF with `pdfplumber` and produces a list of **element dicts**, each either a `"text"` block or a `"table"`.
+
+#### Key Functions
+
+| Function | Lines | Purpose |
+|---|---|---|
+| [_clean_text](file:///Users/arshadshaik/Desktop/ArshadForge/etl/extract.py#L21-L25) | 21–25 | Collapses whitespace, strips non-printable chars while preserving common Unicode (€, accented Latin chars) |
+| [_is_ocr_garbage](file:///Users/arshadshaik/Desktop/ArshadForge/etl/extract.py#L28-L34) | 28–34 | Heuristic: if >50% of tokens are single characters → skip that page's text |
+| [_detect_heading](file:///Users/arshadshaik/Desktop/ArshadForge/etl/extract.py#L37-L51) | 37–51 | Classifies lines as headings via two heuristics: numbered sections (e.g., `3.2 NUMBER OF FIRMS`) or ALL-CAPS lines >10 chars |
+| [_clean_header](file:///Users/arshadshaik/Desktop/ArshadForge/etl/extract.py#L54-L61) | 54–61 | Normalizes individual table column headers; reject headers >120 chars |
+| [_clean_headers](file:///Users/arshadshaik/Desktop/ArshadForge/etl/extract.py#L64-L73) | 64–73 | Cleans all headers; replaces empty ones with positional fallbacks (`Column_1`, `Column_2`, etc.) |
+| [_parse_table](file:///Users/arshadshaik/Desktop/ArshadForge/etl/extract.py#L76-L104) | 76–104 | Converts raw pdfplumber 2D arrays into structured `{columns, rows, page}` dicts. Skips tables with <2 rows. |
+| [extract_pdf](file:///Users/arshadshaik/Desktop/ArshadForge/etl/extract.py#L107-L168) | 107–168 | **Main entry point.** Iterates pages, detects headings, emits text blocks (min 50 chars) and tables. Tracks `current_section` across pages. |
+
+#### Design Decisions
+- **No OCR support**: Scanned PDFs with no embedded text are not handled.
+- **Minimum text threshold**: Pages with <50 chars of cleaned text are skipped (catches headers/footers).
+- **Section tracking**: Headings persist across pages. If a section spans multiple pages, all text blocks under it inherit the same section label.
+
+---
+
+### 3.2 [transform.py](file:///Users/arshadshaik/Desktop/ArshadForge/etl/transform.py) (227 lines)
+
+**Purpose**: Chunks text and classifies tables by type using rule-based keyword matching.
+
+#### Text Chunking Strategy
+- **Chunk size**: 600 tokens (cl100k_base encoding)
+- **Overlap**: 100 tokens between consecutive chunks
+- **Why**: 600 tokens fits comfortably within MiniLM-L6-v2's 256 word-piece limit while preserving context. The overlap ensures no sentence is split without context on both sides.
+
+#### Table Classification Rules (`TABLE_RULES`)
+
+The system uses **9 classification rules**, each with a list of keywords and minimum match thresholds:
+
+| Type | Example Keywords | Min Matches |
+|---|---|---|
+| `growth_projection` | growth, cagr, 2030, projection | 1 |
+| `regional_distribution` | region, cork, dublin, offices | 2 |
+| `firm_size_count` | large, medium, small, micro, ftes | 3 |
+| `firm_classification` | dedicated, diversified, pure-play | 2 |
+| `employment_total` | employment, jobs, 7,351 | 2 |
+| `gva_data` | gva, gross value, €459m | 2 |
+| `benchmark_comparison` | benchmark, northern ireland, estonia | 2 |
+| `taxonomy` | taxonomy, managed security | 2 |
+| `percentage_distribution` | %, percent, share | 2 |
+
+The [_classify_table](file:///Users/arshadshaik/Desktop/ArshadForge/etl/transform.py#L79-L100) function builds a text blob from the first 5 rows + headers + section, then scores each rule. The rule with the highest keyword match count (above its threshold) wins. Fallback: `"other"`.
+
+#### Dual Output
+Tables are stored **twice**:
+1. As **structured records** → SQLite (queryable via SQL)
+2. As **text representations** → ChromaDB (searchable via embeddings)
+
+The [_table_to_text](file:///Users/arshadshaik/Desktop/ArshadForge/etl/transform.py#L206-L227) function converts table rows into a pipe-separated text format for embedding.
+
+---
+
+### 3.3 [load.py](file:///Users/arshadshaik/Desktop/ArshadForge/etl/load.py) (180 lines)
+
+**Purpose**: Orchestrates the full ETL pipeline and loads data into both storage backends.
+
+#### Pipeline Flow
+```
+PDF → extract_pdf() → transform_elements() → _load_vectors() + _load_tables()
+```
+
+#### [_load_vectors](file:///Users/arshadshaik/Desktop/ArshadForge/etl/load.py#L36-L88)
+- Creates a `PersistentClient` ChromaDB instance
+- **Deletes and recreates** the collection on each run (ensures consistency)
+- Batch-upserts chunks in groups of 50
+- Uses the **shared singleton** embedding function from `storage/embeddings.py`
+- Collection uses **cosine similarity** (`hnsw:space: cosine`)
+
+#### [_load_tables](file:///Users/arshadshaik/Desktop/ArshadForge/etl/load.py#L91-L102)
+- Calls `initialize_db()` to ensure schema + seeded data exist
+- Inserts each table record into the `report_tables` table via `INSERT OR IGNORE`
+
+#### [run_etl](file:///Users/arshadshaik/Desktop/ArshadForge/etl/load.py#L107-L171)
+- Auto-discovers the PDF in the project root or `data/raw/`
+- Returns a summary dict with counts of all extracted, transformed, and loaded items
+
+---
+
+## 4. Storage Layer — In Depth
+
+### 4.1 [schema.sql](file:///Users/arshadshaik/Desktop/ArshadForge/storage/schema.sql) (77 lines)
+
+Defines **6 tables**:
+
+| Table | Purpose | Key Columns |
+|---|---|---|
+| `report_tables` | Raw parsed table storage | `table_id`, `page`, `table_type`, `raw_json` |
+| `regional_offices` | Table 3.2 — offices by region | `region`, `total_offices`, `dedicated_offices`, `per_10k_population` |
+| `growth_projections` | Table 7.1 — year-by-year projections | `year`, `gva`, `employment`, `note` |
+| `firm_sizes` | Table 3.1 — firm count by size/origin | `size_category`, `foreign_owned`, `domestic`, `total` |
+| `sector_summary` | High-level sector stats | `metric`, `category`, `count`, `percentage`, `detail` |
+| `gva_estimates` | GVA by firm type | `firm_type`, `avg_salary`, `gva_per_employee`, `total_gva` |
+| `employment_breakdown` | Employment percentages | `total_employment`, `foreign_owned_pct`, `domestic_pct`, `us_pct` |
+
+**Indexes**: On `table_type`, `year`, `region`, and `total_employment`.
+
+### 4.2 [db.py](file:///Users/arshadshaik/Desktop/ArshadForge/storage/db.py) (234 lines)
+
+#### Connection Management
+- Uses SQLite with **WAL journal mode** for better concurrent read performance
+- `sqlite3.Row` factory for dict-like row access
+- Context manager with automatic commit/rollback/close
+
+#### Data Seeding ([_seed_data](file:///Users/arshadshaik/Desktop/ArshadForge/storage/db.py#L68-L170))
+
+This is a **critical design choice**: key tables are populated from **hardcoded Python data** rather than from PDF parsing. This guarantees numeric accuracy but requires human review for each new report.
+
+Seeded data:
+- **10 rows** of growth projections (2021–2030, including employment and GVA figures)
+- **6 rows** of regional offices (Cork, Galway, Dublin, Limerick, Belfast, Ireland total)
+- **5 rows** of firm sizes (Large, Medium, Small, Micro, Total)
+- **6 rows** of sector summary (Total Firms, Total Employment, Dedication and Origin breakdowns)
+- **3 rows** of GVA estimates (Dedicated, Diversified, Total)
+- **1 row** of employment breakdown (7351 total, 71% foreign, 29% domestic, 55% US)
+
+The seed function is **idempotent**: it checks if `growth_projections` is already populated and only re-seeds `employment_breakdown` if missing.
+
+#### Query Safety
+[execute_query](file:///Users/arshadshaik/Desktop/ArshadForge/storage/db.py#L189-L203) — only allows `SELECT` statements (enforced by checking the stripped/uppercased SQL prefix). Parameterized queries prevent injection.
+
+[describe_table](file:///Users/arshadshaik/Desktop/ArshadForge/storage/db.py#L222-L233) — validates table names against `^[a-zA-Z_][a-zA-Z0-9_]*$` regex to prevent injection via `PRAGMA table_info`.
+
+### 4.3 [embeddings.py](file:///Users/arshadshaik/Desktop/ArshadForge/storage/embeddings.py) (37 lines)
+
+**Singleton pattern** for the SentenceTransformer embedding function. This is crucial because ChromaDB will reject queries if the embedding function object differs between ingestion and retrieval (it checks the class name). Both `etl/load.py` and `agents/tools.py` import from this shared module.
+
+The `warmup()` function pre-loads the model during server startup, avoiding cold-start delays on the first query.
+
+---
+
+## 5. Agent Layer — In Depth
+
+### 5.1 [planner.py](file:///Users/arshadshaik/Desktop/ArshadForge/agents/planner.py) (308 lines)
+
+**Purpose**: Rule-based intent classification. **No LLM is used for planning** — this is a deliberate design choice for reliability with smaller models.
+
+#### Intent Classification Flow
+
+```mermaid
+flowchart TD
+    Q[User Query] --> A{Is arithmetic?}
+    A -->|Yes| AR[Intent: arithmetic<br/>Tools: python_calculator]
+    A -->|No| E{Employment + percentage?}
+    E -->|Yes| ES[Intent: employment_stats<br/>Tools: sql_query, citation_validation]
+    E -->|No| O{Ownership keywords?}
+    O -->|Yes| DS1[Intent: data_synthesis<br/>Tools: sql_query, calculator, vector]
+    O -->|No| S{Score rules}
+    S --> |Best match| R[Intent: forecasting / data_synthesis / verification]
+    S --> |No match| G[Intent: general<br/>Tools: vector_retrieval only]
+    R --> H{Looks like data synthesis?}
+    H -->|Yes & not forecasting| DS2[Override to data_synthesis]
+    H -->|No| R
+```
+
+#### Classification Layers (in priority order)
+
+1. **Arithmetic override** — [is_arithmetic_query](file:///Users/arshadshaik/Desktop/ArshadForge/agents/planner.py#L21-L59): Detects expressions like `5 + 3`, `(17333/7351)^(1/9)-1`, and natural language like "17333 divided by 7351". Short-circuits to `python_calculator` only.
+
+2. **Employment percentage override** — If query contains "employment" AND ("percent" or "percentage" or "%"), route directly to `employment_stats` intent.
+
+3. **Ownership keyword override** — Words like "foreign-owned", "domestic", "ownership" force `data_synthesis` intent.
+
+4. **Rule-based scoring** — Each intent rule in `INTENT_RULES` has:
+   - `keywords`: matched by substring inclusion (case-insensitive)
+   - `patterns`: matched by regex
+   - `min_keyword_matches` / `min_pattern_matches`: thresholds
+   - Pattern matches are weighted **2×** more than keyword matches
+   - Additional score boosts applied for common phrasings
+
+5. **Heuristic override** — [_looks_like_data_synthesis](file:///Users/arshadshaik/Desktop/ArshadForge/agents/planner.py#L226-L245): If the query implies multi-field aggregation (mentions "foreign", "domestic", "percentage" with a field term), override to `data_synthesis` unless already classified as `forecasting`.
+
+#### Supported Intents
+
+| Intent | Tools (ordered) | When |
+|---|---|---|
+| `arithmetic` | `python_calculator` | Plain math expressions |
+| `employment_stats` | `sql_query`, `citation_validation` | Employment percentage queries |
+| `verification` | `vector_retrieval`, `sql_query`, `citation_validation` | Fact-checking queries |
+| `data_synthesis` | `sql_query`, `python_calculator`, `vector_retrieval` | Comparative/percentage queries |
+| `forecasting` | `sql_query`, `python_calculator`, `vector_retrieval`, `citation_validation` | CAGR/projection queries |
+| `general` | `vector_retrieval` | Anything else |
+
+---
+
+### 5.2 [tools.py](file:///Users/arshadshaik/Desktop/ArshadForge/agents/tools.py) (352 lines)
+
+Four deterministic tools. **No LLM calls.** All return structured dicts.
+
+#### Tool 1: [vector_retrieval_tool](file:///Users/arshadshaik/Desktop/ArshadForge/agents/tools.py#L57-L112)
+- Queries ChromaDB via `query_texts` (embedding function handles encoding)
+- Returns top-k results with `content`, `page`, `section`, `type`, `score`
+- Score = `1 - cosine_distance` (similarity, 0–1 range)
+- Lazy-initializes ChromaDB collection via [_get_collection](file:///Users/arshadshaik/Desktop/ArshadForge/agents/tools.py#L34-L52)
+
+#### Tool 2: [sql_query_tool](file:///Users/arshadshaik/Desktop/ArshadForge/agents/tools.py#L117-L154)
+- Delegates to `storage.db.execute_query()`
+- Only `SELECT` allowed (enforced at the db layer)
+- Returns results as list of dicts
+
+#### Tool 3: [python_calculator_tool](file:///Users/arshadshaik/Desktop/ArshadForge/agents/tools.py#L159-L228)
+- Uses Python `eval()` with a **restricted namespace** (no builtins)
+- Safe namespace includes: `abs`, `round`, `pow`, `min`, `max`, `sqrt`, `log`, `log10`, `ceil`, `floor`
+- Supports named variables passed in via a dict
+- Auto-formats results: values <1 are shown as percentages, others with commas
+
+> [!IMPORTANT]
+> The `eval()` with `{"__builtins__": {}}` blocks access to dangerous functions like `__import__`, `open`, `exec`, but is **not truly sandboxed**. Crafted inputs could still potentially escape. In production, a proper sandbox (e.g., `ast.literal_eval` or subprocess-based execution) would be safer.
+
+#### Tool 4: [citation_validation_tool](file:///Users/arshadshaik/Desktop/ArshadForge/agents/tools.py#L233-L352)
+- Validates that a claimed number appears in source text
+- **3-tier matching**:
+  1. **Exact match**: Within 0.01 tolerance
+  2. **Tolerance match**: Within 5% for numbers >100
+  3. **Shorthand expansion**: Handles `bn/billion/million/m/k/thousand` suffixes
+- Pre-check: extracts all numeric tokens from the claim and ensures each appears in the source text. Missing tokens → immediate `MISSING_NUMBERS` failure.
+- Returns structured dict with `valid`, `match_type`, `found_numbers`, `page`
+
+---
+
+### 5.3 [graph.py](file:///Users/arshadshaik/Desktop/ArshadForge/agents/graph.py) (988 lines — largest file)
+
+**Purpose**: The central orchestration engine. Implements an explicit state machine:
+
+```
+Query → Planner → [Tool₁ → Tool₂ → ... → Toolₙ] → LLM Composer → Validator → Response
+```
+
+#### Data Classes
+
+| Class | Purpose |
+|---|---|
+| `ToolCall` | Records a single tool invocation (input, output, timing, success) |
+| `AgentTrace` | Full execution trace for a query |
+| `AgentResponse` | Final API response (answer, sources, tools, trace_id, confidence) |
+
+#### [AgentGraph.run()](file:///Users/arshadshaik/Desktop/ArshadForge/agents/graph.py#L107-L234) — Main Entry Point
+
+1. **Plan**: Calls `classify_intent(query)` → returns an `ExecutionPlan`
+2. **Execute**: Dispatches to intent-specific handler based on plan
+3. **Compose**: Builds answer via deterministic templates (most intents) or LLM (general intent)
+4. **Sources**: Extracts and prunes page-level sources
+5. **Confidence**: Computes a 0–1 structural confidence score
+6. **Trace**: Logs full execution trace to disk
+
+#### Intent Handlers (5 handlers)
+
+##### [_handle_arithmetic](file:///Users/arshadshaik/Desktop/ArshadForge/agents/graph.py#L238-L289)
+- Extracts expression from query (sanitizes letters, normalizes `^` → `**`)
+- Falls back to natural language parsing ("divided by", "multiplied by", etc.)
+- Calls `python_calculator_tool`
+
+##### [_handle_verification](file:///Users/arshadshaik/Desktop/ArshadForge/agents/graph.py#L291-L400)
+- SQL query: Gets employment data from `growth_projections` WHERE `note LIKE '%current%'`
+- Vector retrieval: Searches for "total number of jobs employment cybersecurity..."
+- Citation validation: Validates the employment number (7351) appears in the source text
+- **Retry logic**: If citation fails, broadens the vector search query and tries each result
+
+##### [_handle_data_synthesis](file:///Users/arshadshaik/Desktop/ArshadForge/agents/graph.py#L402-L530)
+- SQL query 1: Gets all regional office data
+- SQL query 2: Gets sector summary (dedication breakdown)
+- Calculator: Computes South-West pure-play percentage (Cork+Limerick dedicated / total)
+- Calculator: Computes national average pure-play percentage
+- Vector retrieval: Gets supporting context
+- Stores computed values in `results["computed"]` dict
+
+##### [_handle_forecasting](file:///Users/arshadshaik/Desktop/ArshadForge/agents/graph.py#L532-L656)
+- SQL query 1: Gets 2021 baseline employment (7,351)
+- SQL query 2: Gets 2030 target employment (17,333)
+- Calculator: CAGR = `(17333 / 7351)^(1/9) - 1` ≈ 10.00%
+- Vector retrieval: Gets citation context
+- Citation validation: Validates baseline number in source text
+
+##### [_handle_employment_stats](file:///Users/arshadshaik/Desktop/ArshadForge/agents/graph.py#L658-L702)
+- SQL query: Fetches from `employment_breakdown` table
+- Derives absolute numbers (e.g., 7351 × 0.71 = 5,219 foreign-owned employees)
+- **No vector retrieval** — purely structured data
+
+#### [_compose_answer](file:///Users/arshadshaik/Desktop/ArshadForge/agents/graph.py#L726-L848) — Answer Generation
+
+| Intent | Method | LLM Used? |
+|---|---|---|
+| `arithmetic` | Direct echo: `"Calculation (expr) = result"` | ❌ |
+| `verification` | Template: job count + page + citation status | ❌ |
+| `data_synthesis` | Template: South-West % vs national %, comparison | ❌ |
+| `forecasting` | Template: baseline, target, CAGR %, formula, source | ❌ |
+| `employment_stats` | Template: total, percentage, absolute employee count | ❌ |
+| `general` | **LLM** (Ollama llama3:8b, temp=0.1, max 512 tokens) | ✅ |
+
+> [!NOTE]
+> The LLM is called only for general/unclassified queries. For all structured intents, the answer is built from Python string templates using pre-computed tool results. This is a key reliability feature.
+
+#### [_call_llm](file:///Users/arshadshaik/Desktop/ArshadForge/agents/graph.py#L850-L877)
+- Sends system + user prompt to Ollama's `/api/chat` endpoint
+- Temperature: 0.1 (nearly deterministic)
+- Max tokens: 512
+- Timeout: 120 seconds
+- Graceful error handling for connection failures
+
+#### Confidence Scoring ([run() method, lines 186-211](file:///Users/arshadshaik/Desktop/ArshadForge/agents/graph.py#L186-L211))
+
+Score is computed additively:
+- +0.3 if SQL query succeeded
+- +0.2 if calculator succeeded
+- +0.2 if citation was valid (+0.05 if tool ran but failed)
+- +0.2 if sources exist
+- +0.1 if no validation errors
+- −0.2 if vector retrieval failed
+- −0.1 for each other failed tool
+
+Clamped to [0.0, 1.0].
+
+#### Source Extraction & Pruning ([_extract_sources](file:///Users/arshadshaik/Desktop/ArshadForge/agents/graph.py#L881-L948))
+- Gathers vector hits from `vector_data` and `vector_context` keys
+- **Strict SQL mode** (`STRICT_SQL_SOURCES=true`): drops all vector citations if SQL data exists
+- Delegates pruning to [citation_pruner.py](file:///Users/arshadshaik/Desktop/ArshadForge/agents/citation_pruner.py)
+- Always includes SQL-derived hardcoded sources (Page 27, Page 15, Page 34)
+
+---
+
+### 5.4 [citation_pruner.py](file:///Users/arshadshaik/Desktop/ArshadForge/agents/citation_pruner.py) (56 lines)
+
+**Purpose**: Deterministic scoring to remove irrelevant vector citations.
+
+#### Scoring Scheme
+
+| Condition | Score |
+|---|---|
+| Citation contains exact answer value | +3 |
+| Citation contains anchor phrase (e.g., "employment") | +2 |
+| Citation page matches validated page exactly | +2 |
+| Citation page is ±1 from validated page | +1 |
+| Citation does NOT contain answer value | −2 |
+
+**Minimum score to keep**: 2
+
+This prevents noisy vector results from polluting the final response.
+
+---
+
+## 6. Backend (API Layer) — In Depth
+
+### [main.py](file:///Users/arshadshaik/Desktop/ArshadForge/backend/main.py) (302 lines)
+
+#### Pydantic Models
+
+| Model | Purpose |
+|---|---|
+| `QueryRequest` | Input: `query` string (min 1 char) |
+| `QueryResponse` | Output: `answer`, `sources[]`, `tools_used[]`, `trace_id`, `validation_errors[]`, `confidence` |
+| `SourceInfo` | Page, section, quote |
+| `IngestResponse` | ETL summary stats |
+| `HealthResponse` | System status (ChromaDB, SQLite, Ollama, document) |
+
+#### Endpoints
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/ingest` | Upload PDF → run full ETL pipeline |
+| `POST` | `/query` | Execute agent graph → return structured response |
+| `GET` | `/health` | Check ChromaDB, SQLite, Ollama connectivity |
+
+#### Lifespan (Startup)
+1. Pre-loads the embedding model (`warmup()`)
+2. Creates log + data directories
+3. Initializes `AgentGraph` instance
+4. Initializes SQLite database (schema + seed data)
+5. Reads `STRICT_SQL_SOURCES` config flag
+
+#### Named Trace Saving
+[_save_named_trace](file:///Users/arshadshaik/Desktop/ArshadForge/backend/main.py#L284-L301): Maps known test query keywords to trace filenames:
+- "total number of jobs" → `test1_trace.json`
+- "pure-play" → `test2_trace.json`
+- "cagr" / "compound annual growth" → `test3_trace.json`
+
+#### CORS
+Fully open (`allow_origins=["*"]`). Adequate for development; would need restriction in production.
+
+---
+
+## 7. Test Harness — In Depth
+
+### [run_tests.py](file:///Users/arshadshaik/Desktop/ArshadForge/run_tests.py) (407 lines)
+
+Runs **5 tests** against the live API:
+
+| # | Test Name | Query | Key Assertions |
+|---|---|---|---|
+| 1 | Verification | "What is the total number of jobs reported?" | Answer contains 7351, Page 27, SQL+vector tools used |
+| 1.5 | Employment Stats | "How many employees supported by foreign-owned firms?" | Answer contains 71%, 5219, SQL tool only |
+| 2 | Data Synthesis | "Compare Pure-Play concentration in South-West vs National Average" | Contains %, mentions South-West/Cork, uses SQL+calculator |
+| 3 | Forecasting (CAGR) | "What is the required CAGR to hit the 2030 target?" | CAGR ≈ 10.00% (±2%), contains baseline 7351, target 17333, formula |
+| 4 | Arithmetic | "What is 17333 divided by 7351?" | Uses calculator, contains both numbers |
+
+Each test returns a structured dict with `passed`, `checks`, `raw_answer`, `tools_used`, and `trace_id`. Results are saved to `logs/test_summary.json`.
+
+The harness also checks for **strict SQL mode** from the health endpoint and adds an additional assertion (`strict_single_source`) if enabled.
+
+---
+
+## 8. Data Flow Summary
+
+```mermaid
+flowchart LR
+    subgraph Ingestion
+        PDF["PDF Report"] --> E["extract.py<br/>pdfplumber"]
+        E --> T["transform.py<br/>tiktoken + rules"]
+        T --> |text chunks| C["ChromaDB<br/>MiniLM-L6-v2"]
+        T --> |table records| S["SQLite<br/>schema.sql"]
+    end
+
+    subgraph Query
+        Q["User Query"] --> P["planner.py<br/>intent classify"]
+        P --> G["graph.py<br/>pipeline controller"]
+        G --> |sql_query| S
+        G --> |vector_retrieval| C
+        G --> |python_calculator| CAL["Restricted eval()"]
+        G --> |citation_validation| CV["Number matching"]
+        G --> |general only| LLM["Ollama llama3:8b"]
+        G --> R["Structured Response<br/>+ JSON Trace"]
+    end
+```
+
+---
+
+## 9. Strengths
+
+1. **No LangChain dependency** — lightweight, auditable, no hidden prompt engineering
+2. **Deterministic answers for structured queries** — SQL + calculator guarantees numeric accuracy
+3. **Full execution tracing** — every tool call logged with timing and I/O
+4. **Idempotent seeding** — database initialization is safe to run multiple times
+5. **Shared embedding singleton** — prevents ChromaDB embedding function conflicts
+6. **Citation validation** — multi-tier number matching (exact, tolerance, shorthand expansion)
+7. **Confidence scoring** — structural, not vibes-based
+8. **Retry logic** — failed citation validation triggers broadened search
+9. **Comprehensive test suite** — 5 tests covering all intent paths with explicit assertions
+
+---
+
+## 10. Weaknesses & Improvement Opportunities
+
+| Area | Issue | Suggestion |
+|---|---|---|
+| **Security** | `eval()` in calculator tool is not truly sandboxed | Use `ast.literal_eval` or subprocess sandbox |
+| **Security** | No API authentication | Add API key or OAuth middleware |
+| **Security** | CORS is fully open | Restrict to known origins |
+| **Scalability** | SQLite is single-writer | Migrate to PostgreSQL |
+| **Scalability** | ChromaDB is local-only | Migrate to PGVector or Pinecone |
+| **Scalability** | Single-document design | Add document_id to all tables, collection sharding |
+| **Hardcoded data** | Seed data requires manual curation per report | Automate more table parsing with validation |
+| **Table parsing** | pdfplumber fails on merged cells, rotated text | Add OCR+layout analysis fallback |
+| **LLM** | llama3:8b limits answer quality for general queries | Upgrade to larger model or API |
+| **README** | Duplicate numbered items (3, 4 repeated in "How Factual Reliability") | Minor editorial fix needed |
+| **Testing** | Tests run against live API only | Add unit tests for individual tools and planner |
+| **Error handling** | Some `except Exception` catches are too broad | Catch specific exceptions |
+
+---
+
+## 11. Key Numbers at a Glance
+
+| Metric | Value |
+|---|---|
+| Total Python files | 10 (excluding `__init__.py`) |
+| Total lines of code | ~2,900 |
+| Largest file | `agents/graph.py` (988 lines) |
+| Dependencies | 11 (requirements.txt) |
+| SQLite tables | 7 (including indexes) |
+| Seeded data rows | ~31 |
+| Evaluation tests | 5 |
+| API endpoints | 3 |
+| Deterministic tools | 4 |
+| Supported intents | 6 |
