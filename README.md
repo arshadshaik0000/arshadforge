@@ -311,10 +311,3 @@ ArshadForge/
     ├── test3_trace.json        # Forecasting test trace
     └── test_summary.json       # Overall test results
 ```
-
----
-
-## License
-
-Internal evaluation project. 
-Not for redistribution.
